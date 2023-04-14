@@ -83,7 +83,7 @@ static struct config_enum_list dns_conf_response_mode_enum[] = {
 enum response_mode_type dns_conf_response_mode;
 
 /* cache */
-int dns_conf_cachesize = -1;
+ssize_t dns_conf_cachesize = -1;
 int dns_conf_prefetch = 0;
 int dns_conf_serve_expired = 1;
 int dns_conf_serve_expired_ttl = 24 * 3600 * 3; /* 3 days */
@@ -3250,7 +3250,7 @@ static struct config_item _config_item[] = {
 	CONF_CUSTOM("nftset-no-speed", _config_nftset_no_speed, NULL),
 	CONF_CUSTOM("speed-check-mode", _config_speed_check_mode, NULL),
 	CONF_INT("tcp-idle-time", &dns_conf_tcp_idle_time, 0, 3600),
-	CONF_INT("cache-size", &dns_conf_cachesize, 0, CONF_INT_MAX),
+	CONF_SSIZE("cache-size", &dns_conf_cachesize, 0, CONF_INT_MAX),
 	CONF_CUSTOM("cache-file", _config_option_parser_filepath, (char *)&dns_conf_cache_file),
 	CONF_YESNO("cache-persist", &dns_conf_cache_persist),
 	CONF_YESNO("prefetch-domain", &dns_conf_prefetch),
@@ -3393,6 +3393,19 @@ void dns_server_load_exit(void)
 	_config_proxy_table_destroy();
 
 	dns_conf_server_num = 0;
+	dns_conf_bind_ip_num = 0;
+}
+
+static int _config_add_default_server_if_needed(void)
+{
+	if (dns_conf_bind_ip_num > 0) {
+		return 0;
+	}
+
+	/* add default server */
+	char *argv[] = {"bind", "[::]:53", 0};
+	int argc = sizeof(argv) / sizeof(char *) - 1;
+	return _config_bind_ip(argc, argv, DNS_BIND_TYPE_UDP);
 }
 
 static int _dns_conf_speed_check_mode_verify(void)
@@ -3512,6 +3525,8 @@ static int _dns_conf_load_post(void)
 	_config_domain_set_name_table_destroy();
 
 	_config_update_bootstrap_dns_rule();
+
+	_config_add_default_server_if_needed();
 
 	return 0;
 }
