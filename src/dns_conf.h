@@ -60,8 +60,10 @@ extern "C" {
 #define SMARTDNS_CONF_FILE "/etc/smartdns/smartdns.conf"
 #define SMARTDNS_LOG_FILE "/var/log/smartdns/smartdns.log"
 #define SMARTDNS_AUDIT_FILE "/var/log/smartdns/smartdns-audit.log"
-#define SMARTDNS_CACHE_FILE "/tmp/smartdns.cache"
+#define SMARTDNS_CACHE_FILE "/var/cache/smartdns/smartdns.cache"
+#define SMARTDNS_TMP_CACHE_FILE "/tmp/smartdns.cache"
 #define SMARTDNS_DEBUG_DIR "/tmp/smartdns"
+#define DNS_RESOLV_FILE "/etc/resolv.conf"
 
 enum domain_rule {
 	DOMAIN_RULE_FLAGS = 0,
@@ -125,6 +127,7 @@ typedef enum {
 #define BIND_FLAG_NO_DUALSTACK_SELECTION (1 << 7)
 #define BIND_FLAG_FORCE_AAAA_SOA (1 << 8)
 #define BIND_FLAG_NO_RULE_CNAME (1 << 9)
+#define BIND_FLAG_NO_RULE_NFTSET (1 << 10)
 
 enum response_mode_type {
 	DNS_RESPONSE_MODE_FIRST_PING_IP = 0,
@@ -359,6 +362,14 @@ struct dns_conf_address_rule {
 	radix_tree_t *ipv6;
 };
 
+struct nftset_ipset_rules {
+	struct dns_ipset_rule *ipset;
+	struct dns_ipset_rule *ipset_ip;
+	struct dns_ipset_rule *ipset_ip6;
+	struct dns_nftset_rule *nftset_ip;
+	struct dns_nftset_rule *nftset_ip6;
+};
+
 struct dns_bind_ip {
 	DNS_BIND_TYPE type;
 	uint32_t flags;
@@ -367,6 +378,7 @@ struct dns_bind_ip {
 	const char *ssl_cert_key_file;
 	const char *ssl_cert_key_pass;
 	const char *group;
+	struct nftset_ipset_rules nftset_ipset_rule;
 };
 
 struct dns_qtype_soa_list {
@@ -459,6 +471,7 @@ extern char dns_conf_ca_path[DNS_MAX_PATH];
 
 extern char dns_conf_cache_file[DNS_MAX_PATH];
 extern int dns_conf_cache_persist;
+extern int dns_conf_cache_checkpoint_time;
 
 extern struct dns_domain_check_orders dns_conf_check_orders;
 
@@ -516,6 +529,9 @@ int dns_server_check_update_hosts(void);
 struct dns_proxy_names *dns_server_get_proxy_nams(const char *proxyname);
 
 extern int config_additional_file(void *data, int argc, char *argv[]);
+
+const char *dns_conf_get_cache_dir(void);
+
 #ifdef __cplusplus
 }
 #endif

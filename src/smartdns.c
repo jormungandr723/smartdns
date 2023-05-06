@@ -47,7 +47,8 @@
 #include <ucontext.h>
 
 #define MAX_KEY_LEN 64
-#define SMARTDNS_PID_FILE "/var/run/smartdns.pid"
+#define SMARTDNS_PID_FILE "/run/smartdns.pid"
+#define SMARTDNS_LEGACY_PID_FILE "/var/run/smartdns.pid"
 #define TMP_BUFF_LEN_32 32
 
 static int verbose_screen;
@@ -55,7 +56,7 @@ static int verbose_screen;
 int capget(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
 int capset(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
 
-static int get_uid_gid(int *uid, int *gid)
+static int get_uid_gid(uid_t *uid, gid_t *gid)
 {
 	struct passwd *result = NULL;
 	struct passwd pwd;
@@ -64,7 +65,9 @@ static int get_uid_gid(int *uid, int *gid)
 	int ret = -1;
 
 	if (dns_conf_user[0] == '\0') {
-		return -1;
+		*uid = getuid();
+		*gid = getgid();
+		return 0;
 	}
 
 	bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
@@ -108,8 +111,8 @@ static int drop_root_privilege(void)
 	header.version = _LINUX_CAPABILITY_VERSION;
 #endif
 	header.pid = 0;
-	int uid = 0;
-	int gid = 0;
+	uid_t uid = 0;
+	gid_t gid = 0;
 	int unused __attribute__((unused)) = 0;
 
 	if (get_uid_gid(&uid, &gid) != 0) {
@@ -173,7 +176,7 @@ static void _show_version(void)
 	printf("smartdns %s\n", str_ver);
 }
 
-static int _smartdns_load_from_resolv(void)
+static int _smartdns_load_from_resolv_file(const char *resolv_file)
 {
 	FILE *fp = NULL;
 	char line[MAX_LINE_LEN];
@@ -186,9 +189,9 @@ static int _smartdns_load_from_resolv(void)
 	int filed_num = 0;
 	int line_num = 0;
 
-	fp = fopen(dns_resolv_file, "r");
+	fp = fopen(resolv_file, "r");
 	if (fp == NULL) {
-		tlog(TLOG_ERROR, "open %s failed, %s", dns_resolv_file, strerror(errno));
+		tlog(TLOG_ERROR, "open %s failed, %s", resolv_file, strerror(errno));
 		return -1;
 	}
 
@@ -223,6 +226,16 @@ static int _smartdns_load_from_resolv(void)
 	fclose(fp);
 
 	return ret;
+}
+
+static int _smartdns_load_from_resolv(void)
+{
+	return _smartdns_load_from_resolv_file(dns_resolv_file);
+}
+
+static int _smartdns_load_from_default_resolv(void)
+{
+	return _smartdns_load_from_resolv_file(DNS_RESOLV_FILE);
 }
 
 static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags, struct dns_servers *server)
@@ -375,8 +388,8 @@ static int _smartdns_set_ecs_ip(void)
 
 static int _smartdns_create_cert(void)
 {
-	int uid = 0;
-	int gid = 0;
+	uid_t uid = 0;
+	gid_t gid = 0;
 
 	if (dns_conf_need_cert == 0) {
 		return 0;
@@ -470,10 +483,18 @@ static int _smartdns_init(void)
 		goto errout;
 	}
 
-	for (i = 0; i < 60 && dns_conf_server_num <= 0; i++) {
+	for (i = 0; i < 180 && dns_conf_server_num <= 0; i++) {
 		ret = _smartdns_load_from_resolv();
 		if (ret == 0) {
 			continue;
+		}
+
+		/* try load from default resolv.conf file */
+		if (i > 30 && strncmp(dns_resolv_file, DNS_RESOLV_FILE, MAX_LINE_LEN) != 0) {
+			ret = _smartdns_load_from_default_resolv();
+			if (ret == 0) {
+				continue;
+			}
 		}
 
 		tlog(TLOG_DEBUG, "load dns from resolv failed, retry after 1s, retry times %d.", i + 1);
@@ -607,31 +628,62 @@ static void _reg_signal(void)
 
 static int _smartdns_create_logdir(void)
 {
-	int uid = 0;
-	int gid = 0;
+	uid_t uid = 0;
+	gid_t gid = 0;
+	struct stat sb;
 	char logdir[PATH_MAX] = {0};
+	int unused __attribute__((unused)) = 0;
+
 	safe_strncpy(logdir, _smartdns_log_path(), PATH_MAX);
 	dir_name(logdir);
-
-	if (access(logdir, F_OK) == 0) {
-		return 0;
-	}
-
-	if (mkdir(logdir, 0750) != 0) {
-		if (errno == EEXIST) {
-			return 0;
-		}
-
-		return -1;
-	}
-
-	int unused __attribute__((unused)) = 0;
 
 	if (get_uid_gid(&uid, &gid) != 0) {
 		return -1;
 	}
 
-	unused = chown(logdir, uid, gid);
+	mkdir(logdir, 0750);
+	if (stat(logdir, &sb) == 0 && sb.st_uid == uid && sb.st_gid == gid && (sb.st_mode & 0700) == 0700) {
+		return 0;
+	}
+
+	if (chown(logdir, uid, gid) != 0) {
+		/* disable log */
+		tlog_set_maxlog_count(0);
+	}
+
+	unused = chmod(logdir, 0750);
+	unused = chown(_smartdns_log_path(), uid, gid);
+	return 0;
+}
+
+static int _smartdns_create_cache_dir(void)
+{
+	uid_t uid = 0;
+	gid_t gid = 0;
+	struct stat sb;
+	char cache_dir[PATH_MAX] = {0};
+	int unused __attribute__((unused)) = 0;
+
+	safe_strncpy(cache_dir, dns_conf_get_cache_dir(), PATH_MAX);
+	dir_name(cache_dir);
+
+	if (get_uid_gid(&uid, &gid) != 0) {
+		return -1;
+	}
+
+	mkdir(cache_dir, 0750);
+	if (stat(cache_dir, &sb) == 0 && sb.st_uid == uid && sb.st_gid == gid && (sb.st_mode & 0700) == 0700) {
+		return 0;
+	}
+
+	if (chown(cache_dir, uid, gid) != 0) {
+		if (dns_conf_cache_file[0] == '\0') {
+			safe_strncpy(dns_conf_cache_file, SMARTDNS_TMP_CACHE_FILE, sizeof(dns_conf_cache_file));
+		}
+	}
+
+	unused = chmod(cache_dir, 0750);
+	unused = chown(dns_conf_get_cache_dir(), uid, gid);
 	return 0;
 }
 
@@ -647,6 +699,7 @@ static int _set_rlimit(void)
 static int _smartdns_init_pre(void)
 {
 	_smartdns_create_logdir();
+	_smartdns_create_cache_dir();
 
 	_set_rlimit();
 
@@ -696,9 +749,15 @@ int main(int argc, char *argv[])
 	char pid_file[MAX_LINE_LEN];
 	int signal_ignore = 0;
 	sigset_t empty_sigblock;
+	struct stat sb;
 
 	safe_strncpy(config_file, SMARTDNS_CONF_FILE, MAX_LINE_LEN);
-	safe_strncpy(pid_file, SMARTDNS_PID_FILE, MAX_LINE_LEN);
+
+	if (stat("/run", &sb) == 0 && S_ISDIR(sb.st_mode)) {
+		safe_strncpy(pid_file, SMARTDNS_PID_FILE, MAX_LINE_LEN);
+	} else {
+		safe_strncpy(pid_file, SMARTDNS_LEGACY_PID_FILE, MAX_LINE_LEN);
+	}
 
 	/* patch for Asus router:  unblock all signal*/
 	sigemptyset(&empty_sigblock);
