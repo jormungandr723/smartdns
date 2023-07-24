@@ -63,7 +63,7 @@
 #define DNS_TCP_CONNECT_TIMEOUT (5)
 #define DNS_QUERY_TIMEOUT (500)
 #define DNS_QUERY_RETRY (4)
-#define DNS_PENDING_SERVER_RETRY 40
+#define DNS_PENDING_SERVER_RETRY 60
 #define SOCKET_PRIORITY (6)
 #define SOCKET_IP_TOS (IPTOS_LOWDELAY | IPTOS_RELIABILITY)
 
@@ -161,7 +161,8 @@ struct dns_server_pending {
 	unsigned int has_v6;
 	unsigned int query_v4;
 	unsigned int query_v6;
-	unsigned int has_soa;
+	unsigned int has_soa_v4;
+	unsigned int has_soa_v6;
 
 	/* server type */
 	dns_server_type_t type;
@@ -3378,16 +3379,7 @@ static int _dns_client_setup_server_packet(struct dns_server_info *server_info, 
 	*packet_data = default_packet;
 	*packet_data_len = default_packet_len;
 
-	if (query->qtype != DNS_T_AAAA && query->qtype != DNS_T_A) {
-		/* no need to encode packet */
-		return 0;
-	}
-
-	if (server_info->ecs_ipv4.enable == true && query->qtype == DNS_T_A) {
-		repack = 1;
-	}
-
-	if (server_info->ecs_ipv6.enable == true && query->qtype == DNS_T_AAAA) {
+	if (server_info->ecs_ipv4.enable == true || server_info->ecs_ipv6.enable == true) {
 		repack = 1;
 	}
 
@@ -3429,12 +3421,16 @@ static int _dns_client_setup_server_packet(struct dns_server_info *server_info, 
 
 	dns_set_OPT_payload_size(packet, DNS_IN_PACKSIZE);
 	/* dns_add_OPT_TCP_KEEPALIVE(packet, 600); */
-	if ((query->qtype == DNS_T_A && server_info->ecs_ipv4.enable) ||
-		(query->qtype == DNS_T_AAAA && server_info->ecs_ipv6.enable == 0 && server_info->ecs_ipv4.enable)) {
+	if ((query->qtype == DNS_T_A && server_info->ecs_ipv4.enable)) {
 		dns_add_OPT_ECS(packet, &server_info->ecs_ipv4.ecs);
-	} else if ((query->qtype == DNS_T_AAAA && server_info->ecs_ipv6.enable) ||
-			   (query->qtype == DNS_T_A && server_info->ecs_ipv4.enable == 0 && server_info->ecs_ipv6.enable)) {
+	} else if ((query->qtype == DNS_T_AAAA && server_info->ecs_ipv6.enable)) {
 		dns_add_OPT_ECS(packet, &server_info->ecs_ipv6.ecs);
+	} else {
+		if (server_info->ecs_ipv6.enable) {
+			dns_add_OPT_ECS(packet, &server_info->ecs_ipv6.ecs);
+		} else if (server_info->ecs_ipv4.enable) {
+			dns_add_OPT_ECS(packet, &server_info->ecs_ipv4.ecs);
+		}
 	}
 
 	/* encode packet */
@@ -3671,17 +3667,17 @@ static int _dns_client_query_setup_default_ecs(struct dns_query_struct *query)
 		if (client.ecs_ipv4.enable) {
 			add_ipv4_ecs = 1;
 		} else if (client.ecs_ipv6.enable) {
-			add_ipv4_ecs = 1;
+			add_ipv6_ecs = 1;
 		}
-	}
-
-	if (add_ipv4_ecs) {
-		memcpy(&query->ecs, &client.ecs_ipv4, sizeof(query->ecs));
-		return 0;
 	}
 
 	if (add_ipv6_ecs) {
 		memcpy(&query->ecs, &client.ecs_ipv6, sizeof(query->ecs));
+		return 0;
+	}
+
+	if (add_ipv4_ecs) {
+		memcpy(&query->ecs, &client.ecs_ipv4, sizeof(query->ecs));
 		return 0;
 	}
 
@@ -3913,9 +3909,11 @@ static int _dns_client_pending_server_resolve(const struct dns_result *result, v
 {
 	struct dns_server_pending *pending = user_ptr;
 	int ret = 0;
+	int has_soa = 0;
 
-	if (result->rtcode == DNS_RC_NXDOMAIN || result->ip_num == 0 || result->has_soa == 1) {
-		pending->has_soa = 1;
+	if (result->rtcode == DNS_RC_NXDOMAIN || result->has_soa == 1 || result->rtcode == DNS_RC_REFUSED ||
+		(result->rtcode == DNS_RC_NOERROR && result->ip_num == 0)) {
+		has_soa = 1;
 	}
 
 	if (result->addr_type == DNS_T_A) {
@@ -3923,16 +3921,24 @@ static int _dns_client_pending_server_resolve(const struct dns_result *result, v
 		if (result->rtcode == DNS_RC_NOERROR && result->ip_num > 0) {
 			pending->has_v4 = 1;
 			pending->ping_time_v4 = result->ping_time;
-			pending->has_soa = 0;
+			pending->has_soa_v4 = 0;
 			safe_strncpy(pending->ipv4, result->ip, DNS_HOSTNAME_LEN);
+		} else if (has_soa) {
+			pending->has_v4 = 0;
+			pending->ping_time_v4 = -1;
+			pending->has_soa_v4 = 1;
 		}
 	} else if (result->addr_type == DNS_T_AAAA) {
 		pending->ping_time_v6 = -1;
 		if (result->rtcode == DNS_RC_NOERROR && result->ip_num > 0) {
 			pending->has_v6 = 1;
 			pending->ping_time_v6 = result->ping_time;
-			pending->has_soa = 0;
+			pending->has_soa_v6 = 0;
 			safe_strncpy(pending->ipv6, result->ip, DNS_HOSTNAME_LEN);
+		} else if (has_soa) {
+			pending->has_v6 = 0;
+			pending->ping_time_v6 = -1;
+			pending->has_soa_v6 = 1;
 		}
 	} else {
 		ret = -1;
@@ -4040,7 +4046,7 @@ static void _dns_client_add_pending_servers(void)
 			_dns_client_server_pending_get(pending);
 			if (dns_server_query(pending->host, DNS_T_AAAA, 0, _dns_client_pending_server_resolve, pending) != 0) {
 				_dns_client_server_pending_release(pending);
-				pending->query_v4 = 0;
+				pending->query_v6 = 0;
 			}
 		}
 
@@ -4071,7 +4077,7 @@ static void _dns_client_add_pending_servers(void)
 			continue;
 		}
 
-		if (pending->has_soa && dnsserver_ip == NULL) {
+		if (dnsserver_ip == NULL && pending->has_soa_v4 && pending->has_soa_v6) {
 			tlog(TLOG_WARN, "add pending DNS server %s failed, no such host.", pending->host);
 			_dns_client_server_pending_remove(pending);
 			continue;
@@ -4136,14 +4142,19 @@ static void _dns_client_period_run(unsigned int msec)
 	{
 		/* free timed out query, and notify caller */
 		list_del_init(&query->period_list);
-		_dns_client_check_udp_nat(query);
+
+		/* check udp nat after retrying. */
+		if (atomic_read(&query->retry_count) == 1) {
+			_dns_client_check_udp_nat(query);
+		}
+
 		if (atomic_dec_and_test(&query->retry_count) || (query->has_result != 0)) {
 			_dns_client_query_remove(query);
 			if (query->has_result == 0) {
-				tlog(TLOG_INFO, "retry query %s, type: %d, id: %d failed", query->domain, query->qtype, query->sid);
+				tlog(TLOG_DEBUG, "retry query %s, type: %d, id: %d failed", query->domain, query->qtype, query->sid);
 			}
 		} else {
-			tlog(TLOG_INFO, "retry query %s, type: %d, id: %d", query->domain, query->qtype, query->sid);
+			tlog(TLOG_DEBUG, "retry query %s, type: %d, id: %d", query->domain, query->qtype, query->sid);
 			_dns_client_send_query(query);
 		}
 		_dns_client_query_release(query);
