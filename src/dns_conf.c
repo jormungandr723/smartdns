@@ -17,12 +17,14 @@
  */
 
 #include "dns_conf.h"
+#include "idna.h"
 #include "list.h"
 #include "rbtree.h"
 #include "tlog.h"
 #include "util.h"
 #include <errno.h>
 #include <getopt.h>
+#include <glob.h>
 #include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +65,9 @@ int dns_hosts_record_num;
 
 /* DNS64 */
 struct dns_dns64 dns_conf_dns_dns64;
+
+/* SRV-HOST */
+struct dns_srv_record_table dns_conf_srv_record_table;
 
 /* server ip/port  */
 struct dns_bind_ip dns_conf_bind_ip[DNS_MAX_BIND_IP];
@@ -122,7 +127,7 @@ char dns_conf_ca_path[DNS_MAX_PATH];
 
 char dns_conf_cache_file[DNS_MAX_PATH];
 int dns_conf_cache_persist = 2;
-int dns_conf_cache_checkpoint_time;
+int dns_conf_cache_checkpoint_time = DNS_DEFAULT_CHECKPOINT_TIME;
 
 /* auditing */
 int dns_conf_audit_enable = 0;
@@ -165,6 +170,12 @@ char dns_save_fail_packet_dir[DNS_MAX_PATH];
 char dns_resolv_file[DNS_MAX_PATH];
 int dns_no_pidfile;
 int dns_no_daemon;
+
+struct hash_table conf_file_table;
+struct conf_file_path {
+	struct hlist_node node;
+	char file[DNS_MAX_PATH];
+};
 
 /* ECS */
 struct dns_edns_client_subnet dns_conf_ipv4_ecs;
@@ -301,8 +312,14 @@ static int _get_domain(char *value, char *domain, int max_domain_size, char **pt
 		goto errout;
 	}
 
-	memcpy(domain, begin, len);
-	domain[len] = '\0';
+	size_t domain_len = max_domain_size;
+	domain_len = utf8_to_punycode(begin, len, domain, domain_len);
+	if (domain_len <= 0) {
+		tlog(TLOG_ERROR, "domain name %s invalid", value);
+		goto errout;
+	}
+
+	domain[domain_len] = '\0';
 
 	if (ptr_after_domain) {
 		*ptr_after_domain = end + 1;
@@ -488,6 +505,26 @@ static void _config_proxy_table_destroy(void)
 			free(server);
 		}
 		free(proxy);
+	}
+}
+
+static void _config_srv_record_table_destroy(void)
+{
+	struct dns_srv_records *srv_records = NULL;
+	struct dns_srv_record *srv_record, *tmp1 = NULL;
+	struct hlist_node *tmp = NULL;
+	unsigned int i;
+
+	hash_for_each_safe(dns_conf_srv_record_table.srv, i, tmp, srv_records, node)
+	{
+		list_for_each_entry_safe(srv_record, tmp1, &srv_records->list, list)
+		{
+			list_del(&srv_record->list);
+			free(srv_record);
+		}
+
+		hlist_del_init(&srv_records->node);
+		free(srv_records);
 	}
 }
 
@@ -682,8 +719,6 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		}
 		default:
 			tlog(TLOG_WARN, "unknown server option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
-				 conf_get_current_lineno());
-			syslog(LOG_WARNING, "unknown server option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 				 conf_get_current_lineno());
 			break;
 		}
@@ -1848,6 +1883,122 @@ errout:
 	return 0;
 }
 
+struct dns_srv_records *dns_server_get_srv_record(const char *domain)
+{
+	uint32_t key = 0;
+
+	key = hash_string(domain);
+	struct dns_srv_records *srv_records = NULL;
+	hash_for_each_possible(dns_conf_srv_record_table.srv, srv_records, node, key)
+	{
+		if (strncmp(srv_records->domain, domain, DNS_MAX_CONF_CNAME_LEN) == 0) {
+			return srv_records;
+		}
+	}
+
+	return NULL;
+}
+
+static int _confg_srv_record_add(const char *domain, const char *host, unsigned short priority, unsigned short weight,
+							   unsigned short port)
+{
+	struct dns_srv_records *srv_records = NULL;
+	struct dns_srv_record *srv_record = NULL;
+	uint32_t key = 0;
+
+	srv_records = dns_server_get_srv_record(domain);
+	if (srv_records == NULL) {
+		srv_records = malloc(sizeof(*srv_records));
+		if (srv_records == NULL) {
+			goto errout;
+		}
+		memset(srv_records, 0, sizeof(*srv_records));
+		safe_strncpy(srv_records->domain, domain, DNS_MAX_CONF_CNAME_LEN);
+		INIT_LIST_HEAD(&srv_records->list);
+		key = hash_string(domain);
+		hash_add(dns_conf_srv_record_table.srv, &srv_records->node, key);
+	}
+
+	srv_record = malloc(sizeof(*srv_record));
+	if (srv_record == NULL) {
+		goto errout;
+	}
+	memset(srv_record, 0, sizeof(*srv_record));
+	safe_strncpy(srv_record->host, host, DNS_MAX_CONF_CNAME_LEN);
+	srv_record->priority = priority;
+	srv_record->weight = weight;
+	srv_record->port = port;
+	list_add_tail(&srv_record->list, &srv_records->list);
+
+	return 0;
+errout:
+	if (srv_record != NULL) {
+		free(srv_record);
+	}
+	return -1;
+}
+
+static int _config_srv_record(void *data, int argc, char *argv[])
+{
+	char *value = NULL;
+	char domain[DNS_MAX_CONF_CNAME_LEN];
+	char buff[DNS_MAX_CONF_CNAME_LEN];
+	char *ptr = NULL;
+	int ret = -1;
+
+	char *host_s;
+	char *priority_s;
+	char *weight_s;
+	char *port_s;
+
+	unsigned short priority = 0;
+	unsigned short weight = 0;
+	unsigned short port = 1;
+
+	if (argc < 2) {
+		goto errout;
+	}
+
+	value = argv[1];
+	if (_get_domain(value, domain, DNS_MAX_CONF_CNAME_LEN, &value) != 0) {
+		goto errout;
+	}
+
+	safe_strncpy(buff, value, sizeof(buff));
+
+	host_s = strtok_r(buff, ",", &ptr);
+	if (host_s == NULL) {
+		host_s = "";
+		goto out;
+	}
+
+	port_s = strtok_r(NULL, ",", &ptr);
+	if (port_s != NULL) {
+		port = atoi(port_s);
+	}
+
+	priority_s = strtok_r(NULL, ",", &ptr);
+	if (priority_s != NULL) {
+		priority = atoi(priority_s);
+	}
+
+	weight_s = strtok_r(NULL, ",", &ptr);
+	if (weight_s != NULL) {
+		weight = atoi(weight_s);
+	}
+out:
+	ret = _confg_srv_record_add(domain, host_s, priority, weight, port);
+	if (ret != 0) {
+		goto errout;
+	}
+
+	return 0;
+
+errout:
+	tlog(TLOG_ERROR, "add srv-record %s:%s failed", domain, value);
+	return -1;
+}
+
 static void _config_speed_check_mode_clear(struct dns_domain_check_orders *check_orders)
 {
 	memset(check_orders->orders, 0, sizeof(check_orders->orders));
@@ -2225,8 +2376,6 @@ static int _config_bind_ip(int argc, char *argv[], DNS_BIND_TYPE type)
 		default:
 			tlog(TLOG_WARN, "unknown bind option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 				 conf_get_current_lineno());
-			syslog(LOG_WARNING, "unknown bind option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
-				   conf_get_current_lineno());
 			break;
 		}
 	}
@@ -3275,8 +3424,6 @@ static int _conf_ip_rules(void *data, int argc, char *argv[])
 		default:
 			tlog(TLOG_WARN, "unknown ip-rules option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 				 conf_get_current_lineno());
-			syslog(LOG_WARNING, "unknown ip-rules option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
-				   conf_get_current_lineno());
 			break;
 		}
 	}
@@ -3683,8 +3830,6 @@ static int _conf_domain_rules(void *data, int argc, char *argv[])
 		default:
 			tlog(TLOG_WARN, "unknown domain-rules option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 				 conf_get_current_lineno());
-			syslog(LOG_WARNING, "unknown domain-rules option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
-				   conf_get_current_lineno());
 			break;
 		}
 	}
@@ -4148,6 +4293,7 @@ static struct config_item _config_item[] = {
 	CONF_YESNO("expand-ptr-from-address", &dns_conf_expand_ptr_from_address),
 	CONF_CUSTOM("address", _config_address, NULL),
 	CONF_CUSTOM("cname", _config_cname, NULL),
+	CONF_CUSTOM("srv-record", _config_srv_record, NULL),
 	CONF_CUSTOM("proxy-server", _config_proxy_server, NULL),
 	CONF_YESNO("ipset-timeout", &dns_conf_ipset_timeout_enable),
 	CONF_CUSTOM("ipset", _config_ipset, NULL),
@@ -4226,12 +4372,10 @@ static int _conf_printf(const char *file, int lineno, int ret)
 	case CONF_RET_WARN:
 	case CONF_RET_BADCONF:
 		tlog(TLOG_WARN, "process config failed at '%s:%d'.", file, lineno);
-		syslog(LOG_WARNING, "process config failed at '%s:%d'.", file, lineno);
 		return -1;
 		break;
 	case CONF_RET_NOENT:
 		tlog(TLOG_WARN, "unsupported config at '%s:%d'.", file, lineno);
-		syslog(LOG_WARNING, "unsupported config at '%s:%d'.", file, lineno);
 		return -1;
 		break;
 	default:
@@ -4241,17 +4385,40 @@ static int _conf_printf(const char *file, int lineno, int ret)
 	return 0;
 }
 
-int config_additional_file(void *data, int argc, char *argv[])
+static int conf_file_check_duplicate(const char *conf_file)
 {
-	char *conf_file = NULL;
-	char file_path[DNS_MAX_PATH];
-	char file_path_dir[DNS_MAX_PATH];
+	struct conf_file_path *file = NULL;
+	uint32_t key = 0;
 
-	if (argc < 1) {
+	key = hash_string(conf_file);
+	hash_table_for_each_possible(conf_file_table, file, node, key)
+	{
+		if (strncmp(file->file, conf_file, DNS_MAX_PATH) != 0) {
+			continue;
+		}
+
+		return 0;
+	}
+
+	file = malloc(sizeof(*file));
+	if (file == NULL) {
 		return -1;
 	}
 
-	conf_file = argv[1];
+	safe_strncpy(file->file, conf_file, DNS_MAX_PATH);
+	hash_table_add(conf_file_table, &file->node, key);
+	return -1;
+}
+
+static int conf_additional_file(const char *conf_file)
+{
+	char file_path[DNS_MAX_PATH];
+	char file_path_dir[DNS_MAX_PATH];
+
+	if (conf_file == NULL) {
+		return -1;
+	}
+
 	if (conf_file[0] != '/') {
 		safe_strncpy(file_path_dir, conf_get_conf_file(), DNS_MAX_PATH);
 		dir_name(file_path_dir);
@@ -4269,12 +4436,81 @@ int config_additional_file(void *data, int argc, char *argv[])
 	}
 
 	if (access(file_path, R_OK) != 0) {
-		tlog(TLOG_WARN, "config file '%s' is not readable, %s", conf_file, strerror(errno));
-		syslog(LOG_WARNING, "config file '%s' is not readable, %s", conf_file, strerror(errno));
+		tlog(TLOG_ERROR, "config file '%s' is not readable, %s", conf_file, strerror(errno));
 		return -1;
 	}
 
+	if (conf_file_check_duplicate(file_path) == 0) {
+		return 0;
+	}
+
 	return load_conf(file_path, _config_item, _conf_printf);
+}
+
+int config_additional_file(void *data, int argc, char *argv[])
+{
+	const char *conf_pattern = NULL;
+	char file_path[DNS_MAX_PATH];
+	char file_path_dir[DNS_MAX_PATH];
+	glob_t globbuf = {0};
+
+	if (argc < 1) {
+		return -1;
+	}
+
+	conf_pattern = argv[1];
+	if (conf_pattern == NULL) {
+		return -1;
+	}
+
+	if (conf_pattern[0] != '/') {
+		safe_strncpy(file_path_dir, conf_get_conf_file(), DNS_MAX_PATH);
+		dir_name(file_path_dir);
+		if (strncmp(file_path_dir, conf_get_conf_file(), sizeof(file_path_dir)) == 0) {
+			if (snprintf(file_path, DNS_MAX_PATH, "%s", conf_pattern) < 0) {
+				return -1;
+			}
+		} else {
+			if (snprintf(file_path, DNS_MAX_PATH, "%s/%s", file_path_dir, conf_pattern) < 0) {
+				return -1;
+			}
+		}
+	} else {
+		safe_strncpy(file_path, conf_pattern, DNS_MAX_PATH);
+	}
+
+	errno = 0;
+	if (glob(file_path, 0, NULL, &globbuf) != 0) {
+		if (errno == 0) {
+			return 0;
+		}
+
+		tlog(TLOG_ERROR, "open config file '%s' failed, %s", file_path, strerror(errno));
+		return -1;
+	}
+
+	for (size_t i = 0; i != globbuf.gl_pathc; ++i) {
+		const char *file = globbuf.gl_pathv[i];
+		struct stat statbuf;
+
+		if (stat(file, &statbuf) != 0) {
+			continue;
+		}
+
+		if (!S_ISREG(statbuf.st_mode)) {
+			continue;
+		}
+
+		if (conf_additional_file(file) != 0) {
+			tlog(TLOG_ERROR, "load config file '%s' failed.", file);
+			globfree(&globbuf);
+			return -1;
+		}
+	}
+
+	globfree(&globbuf);
+
+	return 0;
 }
 
 const char *dns_conf_get_cache_dir(void)
@@ -4310,6 +4546,7 @@ static int _dns_server_load_conf_init(void)
 	hash_init(dns_ptr_table.ptr);
 	hash_init(dns_domain_set_name_table.names);
 	hash_init(dns_ip_set_name_table.names);
+	hash_init(dns_conf_srv_record_table.srv);
 
 	return 0;
 }
@@ -4360,6 +4597,7 @@ void dns_server_load_exit(void)
 	_config_host_table_destroy(0);
 	_config_qtype_soa_table_destroy();
 	_config_proxy_table_destroy();
+	_config_srv_record_table_destroy();
 
 	dns_conf_server_num = 0;
 	dns_server_bind_destroy();
@@ -4426,6 +4664,21 @@ static int _dns_ping_cap_check(void)
 	return 0;
 }
 
+static void _config_file_hash_table_destroy(void)
+{
+	struct conf_file_path *file = NULL;
+	struct hlist_node *tmp = NULL;
+	int i = 0;
+
+	hash_table_for_each_safe(conf_file_table, i, tmp, file, node)
+	{
+		hlist_del_init(&file->node);
+		free(file);
+	}
+
+	hash_table_free(conf_file_table, free);
+}
+
 static int _dns_conf_load_pre(void)
 {
 	if (_dns_server_load_conf_init() != 0) {
@@ -4435,6 +4688,8 @@ static int _dns_conf_load_pre(void)
 	_dns_ping_cap_check();
 
 	safe_strncpy(dns_save_fail_packet_dir, SMARTDNS_DEBUG_DIR, sizeof(dns_save_fail_packet_dir));
+
+	hash_table_init(conf_file_table, 8, malloc);
 
 	return 0;
 
@@ -4498,6 +4753,8 @@ static int _dns_conf_load_post(void)
 	_config_update_bootstrap_dns_rule();
 
 	_config_add_default_server_if_needed();
+
+	_config_file_hash_table_destroy();
 
 	return 0;
 }
