@@ -27,12 +27,22 @@ extern "C" {
 
 #define DNS_SERVER_SPKI_LEN 64
 #define DNS_SERVER_GROUP_DEFAULT "default"
+#define DNS_SERVER_GROUP_MDNS "mdns"
+#define DNS_SERVER_GROUP_LOCAL "local"
+#ifdef TEST
+#define DNS_MDNS_IP "127.0.0.1"
+#define DNS_MDNS_PORT 55353
+#else
+#define DNS_MDNS_IP "224.0.0.251"
+#define DNS_MDNS_PORT 5353
+#endif
 
 typedef enum {
 	DNS_SERVER_UDP,
 	DNS_SERVER_TCP,
 	DNS_SERVER_TLS,
 	DNS_SERVER_HTTPS,
+	DNS_SERVER_MDNS,
 	DNS_SERVER_TYPE_END,
 } dns_server_type_t;
 
@@ -49,6 +59,7 @@ typedef enum dns_result_type {
 
 #define DNS_QUEY_OPTION_ECS_DNS (1 << 0)
 #define DNS_QUEY_OPTION_ECS_IP (1 << 1)
+#define DNS_QUEY_OPTION_EDNS0_DO (1 << 2)
 
 int dns_client_init(void);
 
@@ -87,6 +98,10 @@ void dns_client_exit(void);
 
 struct client_dns_server_flag_udp {
 	int ttl;
+};
+
+struct client_dns_server_flag_mdns {
+	char ifname[DNS_MAX_CNAME_LEN];
 };
 
 struct client_dns_server_flag_tls {
@@ -128,6 +143,7 @@ struct client_dns_server_flags {
 		struct client_dns_server_flag_udp udp;
 		struct client_dns_server_flag_tls tls;
 		struct client_dns_server_flag_https https;
+		struct client_dns_server_flag_mdns mdns;
 	};
 };
 
