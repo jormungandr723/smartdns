@@ -17,6 +17,7 @@
  */
 
 #include "conf.h"
+#include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
 #include <linux/limits.h>
@@ -24,7 +25,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
 
 static const char *current_conf_file = NULL;
 static int current_conf_lineno = 0;
@@ -417,7 +417,8 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 
 		line_len = 0;
 		is_last_line_wrap = 0;
-
+		key[0] = '\0';
+		value[0] = '\0';
 		filed_num = sscanf(line, "%63s %8191[^\r\n]s", key, value);
 		if (filed_num <= 0) {
 			continue;
@@ -429,7 +430,7 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 		}
 
 		/* if field format is not key = value, error */
-		if (filed_num != 2) {
+		if (filed_num != 2 && filed_num != 1) {
 			handler(file, line_no, CONF_RET_BADCONF);
 			goto errout;
 		}
