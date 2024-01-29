@@ -1,5 +1,5 @@
 
-# Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+# Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
 #
 # smartdns is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -35,24 +35,30 @@ override CFLAGS += $(EXTRA_CFLAGS)
 
 ifdef VER
  override CFLAGS += -DSMARTDNS_VERION='"$(VER)"'
-else
- HAS_GIT := $(shell command -v git 2> /dev/null)
+endif
+
+HAS_GIT := $(shell command -v git 2> /dev/null)
+ifndef NO_GIT_VER
  ifdef HAS_GIT
   IS_GIT_REPO := $(shell git rev-parse --is-inside-work-tree 2>/dev/null)
   ifdef IS_GIT_REPO
-   override CFLAGS += -DSMARTDNS_VERION='"$(shell git describe --tags --always --dirty)"'
+   override COMMIT_VERION = $(shell git describe --tags --always --dirty)
   endif
  endif
+endif
+
+ifdef COMMIT_VERION
+ override CFLAGS += -DCOMMIT_VERION='"$(shell git describe --tags --always --dirty)"'
 endif
 
 CXXFLAGS=-O2 -g -Wall -std=c++11 
 override CXXFLAGS +=-Iinclude
 
-# ldflags
 ifeq ($(STATIC), yes)
- override LDFLAGS += -lssl -lcrypto -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -static
+ override CFLAGS += -DBUILD_STATIC
+ override LDFLAGS += -lssl -lcrypto -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -static -rdynamic
 else
- override LDFLAGS += -lssl -lcrypto -lpthread -ldl -lm
+ override LDFLAGS += -lssl -lcrypto -lpthread -ldl -lm -rdynamic
 endif
 
 .PHONY: all clean

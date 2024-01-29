@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -821,9 +821,15 @@ int netlink_get_neighbors(int family,
 	char buf[1024 * 16];
 	struct iovec iov = {buf, sizeof(buf)};
 	struct sockaddr_nl sa;
-	struct msghdr msg = {&sa, sizeof(sa), &iov, 1, NULL, 0, 0};
+	struct msghdr msg;
 	int len;
 	int ret = 0;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = &sa;
+	msg.msg_namelen = sizeof(sa);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
 
 	nlh = (struct nlmsghdr *)buf;
 	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
@@ -924,10 +930,14 @@ unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md)
 	return (md);
 }
 
-int SSL_base64_decode(const char *in, unsigned char *out)
+int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen)
 {
 	size_t inlen = strlen(in);
 	int outlen = 0;
+
+	if (max_outlen < (int)inlen / 4 * 3) {
+		goto errout;
+	}
 
 	if (inlen == 0) {
 		return 0;
@@ -2157,10 +2167,6 @@ static int _dns_debug_display(struct dns_packet *packet)
 			case DNS_T_CNAME: {
 				char cname[DNS_MAX_CNAME_LEN];
 				char name[DNS_MAX_CNAME_LEN] = {0};
-				if (dns_conf_force_no_cname) {
-					continue;
-				}
-
 				dns_get_CNAME(rrs, name, DNS_MAX_CNAME_LEN, &ttl, cname, DNS_MAX_CNAME_LEN);
 				printf("domain: %s TTL: %d CNAME: %s\n", name, ttl, cname);
 			} break;

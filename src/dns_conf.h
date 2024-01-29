@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -427,8 +427,26 @@ struct dns_conf_group {
 	char copy_data_section_begin[0];
 	struct dns_conf_ipset_nftset ipset_nftset;
 	struct dns_domain_check_orders check_orders;
+	/* ECS */
+	struct dns_edns_client_subnet ipv4_ecs;
+	struct dns_edns_client_subnet ipv6_ecs;
 	int force_AAAA_SOA;
 	int dualstack_ip_selection;
+	int dns_dualstack_ip_allow_force_AAAA;
+	int dns_dualstack_ip_selection_threshold;
+	int dns_rr_ttl;
+	int dns_rr_ttl_reply_max;
+	int dns_rr_ttl_min;
+	int dns_rr_ttl_max;
+	int dns_local_ttl;
+	int dns_force_no_cname;
+	int dns_prefetch;
+	int dns_serve_expired;
+	int dns_serve_expired_ttl;
+	int dns_serve_expired_prefetch_time;
+	int dns_serve_expired_reply_ttl;
+	int dns_max_reply_ip_num;
+	enum response_mode_type dns_response_mode;
 	char copy_data_section_end[0];
 	const char *group_name;
 };
@@ -436,6 +454,7 @@ struct dns_conf_group {
 struct dns_conf_rule {
 	struct dns_conf_group *default_conf;
 	DECLARE_HASHTABLE(group, 8);
+	int group_num;
 };
 
 struct dns_client_rule {
@@ -597,6 +616,19 @@ extern struct dns_dns64 dns_conf_dns_dns64;
 extern struct dns_bind_ip dns_conf_bind_ip[DNS_MAX_BIND_IP];
 extern int dns_conf_bind_ip_num;
 
+struct dns_conf_plugin {
+	struct hlist_node node;
+	char name[DNS_MAX_CNAME_LEN];
+	char file[DNS_MAX_PATH];
+	char args[DNS_MAX_PATH * 4];
+	int argc;
+	int args_len;
+};
+struct dns_conf_plugin_table {
+	DECLARE_HASHTABLE(plugins, 4);
+};
+extern struct dns_conf_plugin_table dns_conf_plugin_table;
+
 extern char dns_conf_bind_ca_file[DNS_MAX_PATH];
 extern char dns_conf_bind_ca_key_file[DNS_MAX_PATH];
 extern char dns_conf_bind_ca_key_pass[DNS_MAX_PATH];
@@ -604,11 +636,6 @@ extern char dns_conf_need_cert;
 
 extern int dns_conf_tcp_idle_time;
 extern ssize_t dns_conf_cachesize;
-extern int dns_conf_prefetch;
-extern int dns_conf_serve_expired;
-extern int dns_conf_serve_expired_ttl;
-extern int dns_conf_serve_expired_prefetch_time;
-extern int dns_conf_serve_expired_reply_ttl;
 extern struct dns_servers dns_conf_servers[DNS_MAX_SERVERS];
 extern int dns_conf_server_num;
 
@@ -652,28 +679,15 @@ extern char dns_conf_server_name[DNS_MAX_SERVER_NAME_LEN];
 extern struct dns_conf_domain_rule dns_conf_domain_rule;
 extern struct dns_conf_client_rule dns_conf_client_rule;
 
-extern int dns_conf_dualstack_ip_allow_force_AAAA;
-extern int dns_conf_dualstack_ip_selection_threshold;
-
-extern int dns_conf_max_reply_ip_num;
 extern int dns_conf_max_query_limit;
-extern enum response_mode_type dns_conf_response_mode;
-
-extern int dns_conf_rr_ttl;
-extern int dns_conf_rr_ttl_reply_max;
-extern int dns_conf_rr_ttl_min;
-extern int dns_conf_rr_ttl_max;
+extern enum response_mode_type dns_conf_default_response_mode;
 extern int dns_conf_nftset_debug_enable;
 extern int dns_conf_local_ttl;
 extern int dns_conf_mdns_lookup;
+extern int dns_conf_local_ptr_enable;
 extern int dns_conf_acl_enable;
 
-extern int dns_conf_force_no_cname;
-
 extern char dns_conf_user[DNS_CONF_USERNAME_LEN];
-
-extern struct dns_edns_client_subnet dns_conf_ipv4_ecs;
-extern struct dns_edns_client_subnet dns_conf_ipv6_ecs;
 
 extern char dns_conf_sni_proxy_ip[DNS_MAX_IPLEN];
 
@@ -683,6 +697,8 @@ extern char dns_resolv_file[DNS_MAX_PATH];
 
 extern int dns_no_pidfile;
 extern int dns_no_daemon;
+extern int dns_restart_on_crash;
+extern size_t dns_socket_buff_size;
 
 void dns_server_load_exit(void);
 
