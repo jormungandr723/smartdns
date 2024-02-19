@@ -88,6 +88,7 @@ enum response_mode_type dns_conf_default_response_mode = DNS_RESPONSE_MODE_FIRST
 
 /* cache */
 ssize_t dns_conf_cachesize = -1;
+ssize_t dns_conf_cache_max_memsize = -1;
 
 /* upstream servers */
 struct dns_servers dns_conf_servers[DNS_MAX_SERVERS];
@@ -192,6 +193,8 @@ static void _config_ip_iter_free(radix_node_t *node, void *cbctx);
 static int _config_nftset_setvalue(struct dns_nftset_names *nftsets, const char *nftsetvalue);
 static int _config_client_rule_flag_set(const char *ip_cidr, unsigned int flag, unsigned int is_clear);
 static int _config_client_rule_group_add(const char *client, const char *group_name);
+
+#define group_member(m) ((void *)offsetof(struct dns_conf_group, m))
 
 static __attribute__((unused)) int _dns_conf_group_int(int value, int *data)
 {
@@ -326,6 +329,9 @@ static void *_new_dns_rule_ext(enum domain_rule domain_rule, int ext_size)
 		break;
 	case DOMAIN_RULE_CNAME:
 		size = sizeof(struct dns_cname_rule);
+		break;
+	case DOMAIN_RULE_HTTPS:
+		size = sizeof(struct dns_https_record_rule);
 		break;
 	case DOMAIN_RULE_TTL:
 		size = sizeof(struct dns_ttl_rule);
@@ -2535,6 +2541,203 @@ errout:
 	return -1;
 }
 
+static int _conf_domain_rule_https_copy_alpn(char *alpn_data, int max_alpn_len, const char *alpn_str)
+{
+	const char *ptr = NULL;
+	int alpn_len = 0;
+	char *alpn_len_ptr = NULL;
+	char *alpn_ptr = NULL;
+	int total_len = 0;
+
+	ptr = alpn_str;
+	alpn_len_ptr = alpn_data;
+	alpn_ptr = alpn_data + 1;
+	total_len++;
+
+	while (*ptr != '\0') {
+		total_len++;
+		if (total_len > max_alpn_len) {
+			return -1;
+		}
+
+		if (*ptr == ',') {
+			*alpn_len_ptr = alpn_len;
+			alpn_len = 0;
+			alpn_len_ptr = alpn_ptr;
+			ptr++;
+			alpn_ptr++;
+			continue;
+		}
+
+		*alpn_ptr = *ptr;
+		alpn_len++;
+		alpn_ptr++;
+		ptr++;
+	}
+
+	*alpn_len_ptr = alpn_len;
+	return total_len;
+}
+
+static int _conf_domain_rule_https_record(const char *domain, const char *host)
+{
+	struct dns_https_record_rule *https_record_rule = NULL;
+	enum domain_rule type = DOMAIN_RULE_HTTPS;
+	char buff[4096];
+	int key_num = 0;
+	char *keys[16];
+	char *value[16];
+	int priority = -1;
+	/*mode_type, 0: alias mode, 1: service mode */
+	int mode_type = 0;
+
+	safe_strncpy(buff, host, sizeof(buff));
+
+	https_record_rule = _new_dns_rule(type);
+	if (https_record_rule == NULL) {
+		goto errout;
+	}
+
+	if (conf_parse_key_values(buff, &key_num, keys, value) != 0) {
+		tlog(TLOG_ERROR, "input format error, don't have key-value.");
+		goto errout;
+	}
+
+	if (key_num < 1) {
+		tlog(TLOG_ERROR, "invalid parameter.");
+		goto errout;
+	}
+
+	for (int i = 0; i < key_num; i++) {
+		const char *key = keys[i];
+		const char *val = value[i];
+		if (strncmp(key, "#", sizeof("#")) == 0) {
+			if (_config_domain_rule_flag_set(domain, DOMAIN_FLAG_ADDR_HTTPS_SOA, 0) != 0) {
+				goto errout;
+			}
+			break;
+		} else if (strncmp(key, "-", sizeof("-")) == 0) {
+			if (_config_domain_rule_flag_set(domain, DOMAIN_FLAG_ADDR_HTTPS_IGN, 0) != 0) {
+				goto errout;
+			}
+		} else if (strncmp(key, "target", sizeof("target")) == 0) {
+			safe_strncpy(https_record_rule->record.target, val, DNS_MAX_CONF_CNAME_LEN);
+			https_record_rule->record.enable = 1;
+		} else if (strncmp(key, "noipv4hint", sizeof("noipv4hint")) == 0) {
+			https_record_rule->filter.no_ipv4hint = 1;
+		} else if (strncmp(key, "noipv6hint", sizeof("noipv6hint")) == 0) {
+			https_record_rule->filter.no_ipv6hint = 1;
+		} else {
+			mode_type = 1;
+			https_record_rule->record.enable = 1;
+			if (strncmp(key, "priority", sizeof("priority")) == 0) {
+				priority = atoi(val);
+			} else if (strncmp(key, "port", sizeof("port")) == 0) {
+				https_record_rule->record.port = atoi(val);
+
+			} else if (strncmp(key, "alpn", sizeof("alpn")) == 0) {
+				int alpn_len = _conf_domain_rule_https_copy_alpn(https_record_rule->record.alpn, DNS_MAX_ALPN_LEN, val);
+				if (alpn_len <= 0) {
+					tlog(TLOG_ERROR, "invalid option value for %s.", key);
+					goto errout;
+				}
+				https_record_rule->record.alpn_len = alpn_len;
+			} else if (strncmp(key, "ech", sizeof("ech")) == 0) {
+				int ech_len = SSL_base64_decode(val, https_record_rule->record.ech, DNS_MAX_ECH_LEN);
+				if (ech_len < 0) {
+					tlog(TLOG_ERROR, "invalid option value for %s.", key);
+					goto errout;
+				}
+				https_record_rule->record.ech_len = ech_len;
+			} else if (strncmp(key, "ipv4hint", sizeof("ipv4hint")) == 0) {
+				int addr_len = DNS_RR_A_LEN;
+				if (get_raw_addr_by_ip(val, https_record_rule->record.ipv4_addr, &addr_len) != 0) {
+					tlog(TLOG_ERROR, "invalid option value for %s, value: %s", key, val);
+					goto errout;
+				}
+
+				if (addr_len != DNS_RR_A_LEN) {
+					tlog(TLOG_ERROR, "invalid option value for %s, value: %s", key, val);
+					goto errout;
+				}
+				https_record_rule->record.has_ipv4 = 1;
+			} else if (strncmp(key, "ipv6hint", sizeof("ipv6hint")) == 0) {
+				int addr_len = DNS_RR_AAAA_LEN;
+				if (get_raw_addr_by_ip(val, https_record_rule->record.ipv6_addr, &addr_len) != 0) {
+					tlog(TLOG_ERROR, "invalid option value for %s, value: %s", key, val);
+					goto errout;
+				}
+
+				if (addr_len != DNS_RR_AAAA_LEN) {
+					tlog(TLOG_ERROR, "invalid option value for %s, value: %s", key, val);
+					goto errout;
+				}
+				https_record_rule->record.has_ipv6 = 1;
+			} else {
+				tlog(TLOG_WARN, "invalid parameter %s for https-record.", key);
+				continue;
+			}
+		}
+	}
+
+	if (mode_type == 0) {
+		if (priority < 0) {
+			priority = 0;
+		}
+	} else {
+		if (priority < 0) {
+			priority = 1;
+		} else if (priority == 0) {
+			tlog(TLOG_WARN, "invalid priority %d for https-record.", priority);
+			goto errout;
+		}
+	}
+
+	https_record_rule->record.priority = priority;
+
+	if (_config_domain_rule_add(domain, type, https_record_rule) != 0) {
+		goto errout;
+	}
+
+	_dns_rule_put(&https_record_rule->head);
+	https_record_rule = NULL;
+
+	return 0;
+errout:
+	if (https_record_rule) {
+		_dns_rule_put(&https_record_rule->head);
+	}
+
+	return -1;
+}
+
+static int _config_https_record(void *data, int argc, char *argv[])
+{
+	char *value = NULL;
+	char domain[DNS_MAX_CONF_CNAME_LEN];
+	int ret = -1;
+
+	if (argc < 2) {
+		goto errout;
+	}
+
+	value = argv[1];
+	if (_get_domain(value, domain, DNS_MAX_CONF_CNAME_LEN, &value) != 0) {
+		goto errout;
+	}
+
+	ret = _conf_domain_rule_https_record(domain, value);
+	if (ret != 0) {
+		goto errout;
+	}
+
+	return 0;
+
+errout:
+	tlog(TLOG_ERROR, "add https-record %s:%s failed", domain, value);
+	return -1;
+}
+
 static void _config_speed_check_mode_clear(struct dns_domain_check_orders *check_orders)
 {
 	memset(check_orders->orders, 0, sizeof(check_orders->orders));
@@ -4624,6 +4827,7 @@ static int _conf_domain_rules(void *data, int argc, char *argv[])
 		{"speed-check-mode", required_argument, NULL, 'c'},
 		{"response-mode", required_argument, NULL, 'r'},
 		{"address", required_argument, NULL, 'a'},
+		{"https-record", required_argument, NULL, 'h'},
 		{"ipset", required_argument, NULL, 'p'},
 		{"nftset", required_argument, NULL, 't'},
 		{"nameserver", required_argument, NULL, 'n'},
@@ -4678,7 +4882,7 @@ static int _conf_domain_rules(void *data, int argc, char *argv[])
 	optind = 1;
 	optind_last = 1;
 	while (1) {
-		opt = getopt_long_only(argc, argv, "c:a:p:t:n:d:A:r:g:", long_options, NULL);
+		opt = getopt_long_only(argc, argv, "c:a:p:t:n:d:A:r:g:h:", long_options, NULL);
 		if (opt == -1) {
 			break;
 		}
@@ -4718,6 +4922,19 @@ static int _conf_domain_rules(void *data, int argc, char *argv[])
 
 			if (_conf_domain_rule_address(domain, address) != 0) {
 				tlog(TLOG_ERROR, "add address rule failed.");
+				goto errout;
+			}
+
+			break;
+		}
+		case 'h': {
+			const char *https_record = optarg;
+			if (https_record == NULL) {
+				goto errout;
+			}
+
+			if (_conf_domain_rule_https_record(domain, https_record) != 0) {
+				tlog(TLOG_ERROR, "add https-record rule failed.");
 				goto errout;
 			}
 
@@ -5709,36 +5926,34 @@ static struct config_item _config_item[] = {
 	CONF_CUSTOM("address", _config_address, NULL),
 	CONF_CUSTOM("cname", _config_cname, NULL),
 	CONF_CUSTOM("srv-record", _config_srv_record, NULL),
+	CONF_CUSTOM("https-record", _config_https_record, NULL),
 	CONF_CUSTOM("proxy-server", _config_proxy_server, NULL),
-	CONF_YESNO_FUNC("ipset-timeout", _dns_conf_group_yesno,
-					(void *)offsetof(struct dns_conf_group, ipset_nftset.ipset_timeout_enable)),
+	CONF_YESNO_FUNC("ipset-timeout", _dns_conf_group_yesno, group_member(ipset_nftset.ipset_timeout_enable)),
 	CONF_CUSTOM("ipset", _config_ipset, NULL),
 	CONF_CUSTOM("ipset-no-speed", _config_ipset_no_speed, NULL),
-	CONF_YESNO_FUNC("nftset-timeout", _dns_conf_group_yesno,
-					(void *)offsetof(struct dns_conf_group, ipset_nftset.nftset_timeout_enable)),
+	CONF_YESNO_FUNC("nftset-timeout", _dns_conf_group_yesno, group_member(ipset_nftset.nftset_timeout_enable)),
 	CONF_YESNO("nftset-debug", &dns_conf_nftset_debug_enable),
 	CONF_CUSTOM("nftset", _config_nftset, NULL),
 	CONF_CUSTOM("nftset-no-speed", _config_nftset_no_speed, NULL),
 	CONF_CUSTOM("speed-check-mode", _config_speed_check_mode, NULL),
 	CONF_INT("tcp-idle-time", &dns_conf_tcp_idle_time, 0, 3600),
-	CONF_SSIZE("cache-size", &dns_conf_cachesize, 0, CONF_INT_MAX),
+	CONF_SSIZE("cache-size", &dns_conf_cachesize, -1, CONF_INT_MAX),
+	CONF_SSIZE("cache-mem-size", &dns_conf_cache_max_memsize, 0, CONF_INT_MAX),
 	CONF_CUSTOM("cache-file", _config_option_parser_filepath, (char *)&dns_conf_cache_file),
 	CONF_YESNO("cache-persist", &dns_conf_cache_persist),
 	CONF_INT("cache-checkpoint-time", &dns_conf_cache_checkpoint_time, 0, 3600 * 24 * 7),
-	CONF_YESNO_FUNC("prefetch-domain", _dns_conf_group_yesno, (void *)offsetof(struct dns_conf_group, dns_prefetch)),
-	CONF_YESNO_FUNC("serve-expired", _dns_conf_group_yesno, (void *)offsetof(struct dns_conf_group, dns_serve_expired)),
-	CONF_INT_FUNC("serve-expired-ttl", _dns_conf_group_int,
-				  (void *)offsetof(struct dns_conf_group, dns_serve_expired_ttl), 0, CONF_INT_MAX),
-	CONF_INT_FUNC("serve-expired-reply-ttl", _dns_conf_group_int,
-				  (void *)offsetof(struct dns_conf_group, dns_serve_expired_reply_ttl), 0, CONF_INT_MAX),
-	CONF_INT_FUNC("serve-expired-prefetch-time", _dns_conf_group_int,
-				  (void *)offsetof(struct dns_conf_group, dns_serve_expired_prefetch_time), 0, CONF_INT_MAX),
-	CONF_YESNO_FUNC("dualstack-ip-selection", _dns_conf_group_yesno,
-					(void *)offsetof(struct dns_conf_group, dualstack_ip_selection)),
+	CONF_YESNO_FUNC("prefetch-domain", _dns_conf_group_yesno, group_member(dns_prefetch)),
+	CONF_YESNO_FUNC("serve-expired", _dns_conf_group_yesno, group_member(dns_serve_expired)),
+	CONF_INT_FUNC("serve-expired-ttl", _dns_conf_group_int, group_member(dns_serve_expired_ttl), 0, CONF_INT_MAX),
+	CONF_INT_FUNC("serve-expired-reply-ttl", _dns_conf_group_int, group_member(dns_serve_expired_reply_ttl), 0,
+				  CONF_INT_MAX),
+	CONF_INT_FUNC("serve-expired-prefetch-time", _dns_conf_group_int, group_member(dns_serve_expired_prefetch_time), 0,
+				  CONF_INT_MAX),
+	CONF_YESNO_FUNC("dualstack-ip-selection", _dns_conf_group_yesno, group_member(dualstack_ip_selection)),
 	CONF_YESNO_FUNC("dualstack-ip-allow-force-AAAA", _dns_conf_group_yesno,
-					(void *)offsetof(struct dns_conf_group, dns_dualstack_ip_allow_force_AAAA)),
+					group_member(dns_dualstack_ip_allow_force_AAAA)),
 	CONF_INT_FUNC("dualstack-ip-selection-threshold", _dns_conf_group_int,
-				  (void *)offsetof(struct dns_conf_group, dns_dualstack_ip_selection_threshold), 0, 1000),
+				  group_member(dns_dualstack_ip_selection_threshold), 0, 1000),
 	CONF_CUSTOM("dns64", _config_dns64, NULL),
 	CONF_CUSTOM("log-level", _config_log_level, NULL),
 	CONF_CUSTOM("log-file", _config_option_parser_filepath, (char *)dns_conf_log_file),
@@ -5756,23 +5971,17 @@ static struct config_item _config_item[] = {
 	CONF_YESNO("audit-console", &dns_conf_audit_console),
 	CONF_YESNO("audit-syslog", &dns_conf_audit_syslog),
 	CONF_YESNO("acl-enable", &dns_conf_acl_enable),
-	CONF_INT_FUNC("rr-ttl", _dns_conf_group_int, (void *)offsetof(struct dns_conf_group, dns_rr_ttl), 0, CONF_INT_MAX),
-	CONF_INT_FUNC("rr-ttl-min", _dns_conf_group_int, (void *)offsetof(struct dns_conf_group, dns_rr_ttl_min), 0,
-				  CONF_INT_MAX),
-	CONF_INT_FUNC("rr-ttl-max", _dns_conf_group_int, (void *)offsetof(struct dns_conf_group, dns_rr_ttl_max), 0,
-				  CONF_INT_MAX),
-	CONF_INT_FUNC("rr-ttl-reply-max", _dns_conf_group_int,
-				  (void *)offsetof(struct dns_conf_group, dns_rr_ttl_reply_max), 0, CONF_INT_MAX),
-	CONF_INT_FUNC("local-ttl", _dns_conf_group_int, (void *)offsetof(struct dns_conf_group, dns_local_ttl), 0,
-				  CONF_INT_MAX),
-	CONF_INT_FUNC("max-reply-ip-num", _dns_conf_group_int,
-				  (void *)offsetof(struct dns_conf_group, dns_max_reply_ip_num), 1, CONF_INT_MAX),
+	CONF_INT_FUNC("rr-ttl", _dns_conf_group_int, group_member(dns_rr_ttl), 0, CONF_INT_MAX),
+	CONF_INT_FUNC("rr-ttl-min", _dns_conf_group_int, group_member(dns_rr_ttl_min), 0, CONF_INT_MAX),
+	CONF_INT_FUNC("rr-ttl-max", _dns_conf_group_int, group_member(dns_rr_ttl_max), 0, CONF_INT_MAX),
+	CONF_INT_FUNC("rr-ttl-reply-max", _dns_conf_group_int, group_member(dns_rr_ttl_reply_max), 0, CONF_INT_MAX),
+	CONF_INT_FUNC("local-ttl", _dns_conf_group_int, group_member(dns_local_ttl), 0, CONF_INT_MAX),
+	CONF_INT_FUNC("max-reply-ip-num", _dns_conf_group_int, group_member(dns_max_reply_ip_num), 1, CONF_INT_MAX),
 	CONF_INT("max-query-limit", &dns_conf_max_query_limit, 0, CONF_INT_MAX),
-	CONF_ENUM_FUNC("response-mode", _dns_conf_group_enum, (void *)offsetof(struct dns_conf_group, dns_response_mode),
+	CONF_ENUM_FUNC("response-mode", _dns_conf_group_enum, group_member(dns_response_mode),
 				   &dns_conf_response_mode_enum),
-	CONF_YESNO_FUNC("force-AAAA-SOA", _dns_conf_group_yesno, (void *)offsetof(struct dns_conf_group, force_AAAA_SOA)),
-	CONF_YESNO_FUNC("force-no-CNAME", _dns_conf_group_yesno,
-					(void *)offsetof(struct dns_conf_group, dns_force_no_cname)),
+	CONF_YESNO_FUNC("force-AAAA-SOA", _dns_conf_group_yesno, group_member(force_AAAA_SOA)),
+	CONF_YESNO_FUNC("force-no-CNAME", _dns_conf_group_yesno, group_member(dns_force_no_cname)),
 	CONF_CUSTOM("force-qtype-SOA", _config_qtype_soa, NULL),
 	CONF_CUSTOM("blacklist-ip", _config_blacklist_ip, NULL),
 	CONF_CUSTOM("whitelist-ip", _conf_whitelist_ip, NULL),
