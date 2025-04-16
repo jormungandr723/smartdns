@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,11 +17,11 @@
  */
 
 #include "server.h"
-#include "dns_server.h"
-#include "fast_ping.h"
+#include "smartdns/dns_server.h"
+#include "smartdns/fast_ping.h"
 #include "include/utils.h"
-#include "smartdns.h"
-#include "util.h"
+#include "smartdns/smartdns.h"
+#include "smartdns/util.h"
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <fstream>
@@ -34,6 +34,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+
+extern int dns_ping_cap_force_enable;
 
 namespace smartdns
 {
@@ -65,7 +67,7 @@ void MockServer::Stop()
 
 	if (fd_ > 0) {
 		close(fd_);
-		fd_ = -1;;
+		fd_ = -1;
 	}
 }
 
@@ -102,7 +104,7 @@ void MockServer::Run()
 			struct ServerRequestContext request;
 			memset(&request, 0, sizeof(request));
 
-			int ret = dns_decode(packet, sizeof(packet_buff), in_buff, len);
+			ret = dns_decode(packet, sizeof(packet_buff), in_buff, len);
 			if (ret == 0) {
 				request.packet = packet;
 				query_id = packet->head.id;
@@ -324,6 +326,8 @@ void Server::StartPost(void *arg)
 
 	if (has_ipv6 == true) {
 		fast_ping_fake_ip_add(PING_TYPE_ICMP, "2001::", 64, 10);
+		fast_ping_fake_ip_add(PING_TYPE_TCP, "[2001::]:80", 64, 10);
+		fast_ping_fake_ip_add(PING_TYPE_TCP, "[2001::]:443", 64, 10);
 		dns_server_check_ipv6_ready();
 	}
 }
@@ -342,7 +346,7 @@ bool Server::Start(const std::string &conf, enum CONF_TYPE type)
 			close(fds[0]);
 		}
 
-		if (fds[0] > 0) {
+		if (fds[1] > 0) {
 			close(fds[1]);
 		}
 	};
@@ -387,7 +391,8 @@ cache-persist no
 			}
 
 			smartdns_reg_post_func(Server::StartPost, this);
-			smartdns_main(args.size(), argv, fds[1], 0);
+			dns_ping_cap_force_enable = 1;
+			smartdns_test_main(args.size(), argv, fds[1], 0);
 			_exit(1);
 		} else if (pid < 0) {
 			return false;
@@ -401,7 +406,8 @@ cache-persist no
 			}
 
 			smartdns_reg_post_func(Server::StartPost, this);
-			smartdns_main(args.size(), argv, fds[1], 1);
+			dns_ping_cap_force_enable = 1;
+			smartdns_test_main(args.size(), argv, fds[1], 1);
 			smartdns_reg_post_func(nullptr, nullptr);
 		});
 	} else {
@@ -443,7 +449,9 @@ void Server::Stop(bool graceful)
 		}
 	}
 
-	waitpid(pid_, nullptr, 0);
+	if (pid_ > 0) {
+		waitpid(pid_, nullptr, 0);
+	}
 
 	pid_ = 0;
 }

@@ -1,5 +1,5 @@
 
-# Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+# Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
 #
 # smartdns is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -14,10 +14,15 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-BIN=smartdns 
-OBJS_LIB=$(patsubst %.c,%.o,$(wildcard lib/*.c))
-OBJS_MAIN=$(patsubst %.c,%.o,$(wildcard *.c))
-OBJS=$(OBJS_MAIN) $(OBJS_LIB)
+BIN=smartdns
+SMARTDNS_LIB=libsmartdns.a
+SMARTDNS_TEST_LIB=libsmartdns-test.a
+# libs without main.o
+OBJS=$(filter-out main.o, $(patsubst %.c,%.o,$(wildcard *.c)) $(patsubst %.c,%.o,$(wildcard */*.c)))
+# libs without lib/%.o
+LINT_OBJS=$(filter-out lib/%.o, $(OBJS))
+TEST_OBJS=$(patsubst %.o,%_test.o,$(OBJS))
+MAIN_OBJ = main.o
 
 # cflags
 ifndef CFLAGS
@@ -61,21 +66,35 @@ CXXFLAGS=-O2 -g -Wall -std=c++11
 override CXXFLAGS +=-Iinclude
 
 ifeq ($(STATIC), yes)
+STATIC = 1
+endif
+
+ifdef STATIC
  override CFLAGS += -DBUILD_STATIC
  override LDFLAGS += -lssl -lcrypto -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -static -rdynamic
 else
  override LDFLAGS += -lssl -lcrypto -lpthread -ldl -lm -rdynamic
 endif
+override LDFLAGS += $(EXTRA_LDFLAGS)
 
 .PHONY: all clean
 
 all: $(BIN)
 
-$(BIN) : $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+%_test.o: %.c
+	$(CC) -DTEST $(CFLAGS) -c $< -o $@
+
+$(BIN) : $(MAIN_OBJ) $(SMARTDNS_LIB)
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+$(SMARTDNS_TEST_LIB): $(TEST_OBJS)
+	$(AR) rcs $@ $^
+
+$(SMARTDNS_LIB): $(OBJS)
+	$(AR) rcs $@ $^
 
 clang-tidy:
-	clang-tidy -p=. $(OBJS_MAIN:.o=.c) -- $(CFLAGS)
+	clang-tidy -p=. $(LINT_OBJS:.o=.c) -- $(CFLAGS)
 
 clean:
-	$(RM) $(OBJS) $(BIN)
+	$(RM) $(OBJS) $(BIN) $(SMARTDNS_LIB) $(MAIN_OBJ) $(SMARTDNS_TEST_LIB) $(TEST_OBJS)

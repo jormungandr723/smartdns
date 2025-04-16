@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,13 +15,14 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+#define _GNU_SOURCE
 
-#include "fast_ping.h"
-#include "atomic.h"
-#include "hashtable.h"
-#include "list.h"
-#include "tlog.h"
-#include "util.h"
+#include "smartdns/fast_ping.h"
+#include "smartdns/lib/atomic.h"
+#include "smartdns/lib/hashtable.h"
+#include "smartdns/lib/list.h"
+#include "smartdns/tlog.h"
+#include "smartdns/util.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -191,6 +192,7 @@ static int bool_print_log = 1;
 static void _fast_ping_host_put(struct ping_host_struct *ping_host);
 static int _fast_ping_get_addr_by_type(PING_TYPE type, const char *ip_str, int port, struct addrinfo **out_gai,
 									   FAST_PING_TYPE *out_ping_type);
+static int _fast_ping_create_icmp(FAST_PING_TYPE type);
 
 static void _fast_ping_wakeup_thread(void)
 {
@@ -704,11 +706,26 @@ static void _fast_ping_host_remove(struct ping_host_struct *ping_host)
 	_fast_ping_host_put(ping_host);
 }
 
+static int _fast_ping_icmp_create_socket(struct ping_host_struct *ping_host)
+{
+	if (_fast_ping_create_icmp(ping_host->type) < 0) {
+		goto errout;
+	}
+
+	return 0;
+errout:
+	return -1;
+}
+
 static int _fast_ping_sendping_v6(struct ping_host_struct *ping_host)
 {
 	struct fast_ping_packet *packet = &ping_host->packet;
 	struct icmp6_hdr *icmp6 = &packet->icmp6;
 	int len = 0;
+
+	if (_fast_ping_icmp_create_socket(ping_host) < 0) {
+		goto errout;
+	}
 
 	if (ping.fd_icmp6 <= 0) {
 		errno = EADDRNOTAVAIL;
@@ -733,23 +750,26 @@ static int _fast_ping_sendping_v6(struct ping_host_struct *ping_host)
 				 ping_host->addr_len);
 	if (len != sizeof(struct fast_ping_packet)) {
 		int err = errno;
-		if (errno == ENETUNREACH || errno == EINVAL || errno == EADDRNOTAVAIL || errno == EHOSTUNREACH) {
+		switch (err) {
+		case ENETUNREACH:
+		case EINVAL:
+		case EADDRNOTAVAIL:
+		case EHOSTUNREACH:
+		case ENOBUFS:
+		case EACCES:
+		case EPERM:
+		case EAFNOSUPPORT:
 			goto errout;
+		default:
+			break;
 		}
 
 		if (is_private_addr_sockaddr(&ping_host->addr, ping_host->addr_len)) {
 			goto errout;
 		}
 
-		if (errno == EACCES || errno == EPERM) {
-			if (bool_print_log == 0) {
-				goto errout;
-			}
-			bool_print_log = 0;
-		}
-
 		char ping_host_name[PING_MAX_HOSTLEN];
-		tlog(TLOG_ERROR, "sendto %s, id %d, %s",
+		tlog(TLOG_WARN, "sendto %s, id %d, %s",
 			 get_host_by_addr(ping_host_name, sizeof(ping_host_name), (struct sockaddr *)&ping_host->addr),
 			 ping_host->sid, strerror(err));
 		goto errout;
@@ -795,6 +815,15 @@ errout:
 
 static int _fast_ping_sendping_v4(struct ping_host_struct *ping_host)
 {
+	if (_fast_ping_icmp_create_socket(ping_host) < 0) {
+		goto errout;
+	}
+
+	if (ping.fd_icmp <= 0) {
+		errno = EADDRNOTAVAIL;
+		goto errout;
+	}
+
 	struct fast_ping_packet *packet = &ping_host->packet;
 	struct icmp *icmp = &packet->icmp;
 	int len = 0;
@@ -1258,10 +1287,6 @@ static int _fast_ping_get_addr_by_icmp(const char *ip_str, int port, struct addr
 	default:
 		goto errout;
 		break;
-	}
-
-	if (_fast_ping_create_icmp(ping_type) < 0) {
-		goto errout;
 	}
 
 	if (out_gai != NULL) {

@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,10 +17,10 @@
  */
 
 #include "client.h"
-#include "dns.h"
+#include "smartdns/dns.h"
 #include "include/utils.h"
 #include "server.h"
-#include "util.h"
+#include "smartdns/util.h"
 #include "gtest/gtest.h"
 #include <fstream>
 
@@ -55,7 +55,9 @@ domain-rules /a.com/ -r fastest-response
 	std::cout << client.GetResult() << std::endl;
 	ASSERT_EQ(client.GetAnswerNum(), 1);
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
-	EXPECT_GT(client.GetQueryTime(), 100);
+	if (smartdns::IsICMPAvailable()) {
+		EXPECT_GT(client.GetQueryTime(), 100);
+	}
 	EXPECT_EQ(client.GetAnswer()[0].GetName(), "b.com");
 	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 600);
 
@@ -131,7 +133,10 @@ domain-rules /a.com/ -c none
 	std::cout << client.GetResult() << std::endl;
 	ASSERT_EQ(client.GetAnswerNum(), 1);
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
-	EXPECT_GT(client.GetQueryTime(), 200);
+	if (smartdns::IsICMPAvailable()) {
+		EXPECT_GT(client.GetQueryTime(), 200);
+	}
+
 	EXPECT_EQ(client.GetAnswer()[0].GetName(), "b.com");
 	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 600);
 
